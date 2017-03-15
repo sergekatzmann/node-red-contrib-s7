@@ -34,26 +34,42 @@ module.exports = function(RED) {
     }
 
     function generateStatus(status, val) {
-      var obj;
+        var obj;
 
-      if(typeof val != 'string' && typeof val != 'number') {
-        val = RED._("s7.endpoint.status.online");
-      }
+        if (typeof val != 'string' && typeof val != 'number' && typeof val != 'boolean') {
+            val = RED._("s7.endpoint.status.online");
+        }
 
-      switch (status) {
-        case 'online':
-          obj = {fill:'green', shape:'dot', text: val};
-          break;
-        case 'badvalues':
-          obj = {fill:'yellow', shape:'dot', text:RED._("s7.endpoint.status.badvalues")};
-          break;
-        case 'offline':
-          obj = {fill:'red', shape:'dot', text:RED._("s7.endpoint.status.offline")};
-          break;
-        default:
-          obj = {fill:'grey', shape:'dot', text:RED._("s7.endpoint.status.unknown")};
-      }
-      return obj;
+        switch (status) {
+            case 'online':
+                obj = {
+                    fill: 'green',
+                    shape: 'dot',
+                    text: val.toString()
+                };
+                break;
+            case 'badvalues':
+                obj = {
+                    fill: 'yellow',
+                    shape: 'dot',
+                    text: RED._("s7.endpoint.status.badvalues")
+                };
+                break;
+            case 'offline':
+                obj = {
+                    fill: 'red',
+                    shape: 'dot',
+                    text: RED._("s7.endpoint.status.offline")
+                };
+                break;
+            default:
+                obj = {
+                    fill: 'grey',
+                    shape: 'dot',
+                    text: RED._("s7.endpoint.status.unknown")
+                };
+        }
+        return obj;
     }
 
     function S7Endpoint(config) {
@@ -61,10 +77,12 @@ module.exports = function(RED) {
         var node = this;
         var oldValues = {};
         var status;
+        var readInProgress = false;
+        var readDeferred = false;
         var vars = config.vartable;
 
-        if(typeof vars == 'string') {
-          vars = JSON.parse(vars);
+        if (typeof vars == 'string') {
+            vars = JSON.parse(vars);
         }
 
         RED.nodes.createNode(this, config);
@@ -74,14 +92,27 @@ module.exports = function(RED) {
             silent: true
         });
 
+        node.getStatus = function getStatus() {
+            return status;
+        }
+
         function manageStatus(newStatus) {
-            if(status == newStatus) return;
+            if (status == newStatus) return;
 
             status = newStatus;
-            node.emit('__STATUS__', {status: status});
+            node.emit('__STATUS__', {
+                status: status
+            });
         }
 
         function cycleCallback(err, values) {
+            readInProgress = false;
+
+            if(readDeferred) {
+                doCycle();
+                readDeferred = false;
+            }
+
             if (err) {
                 manageStatus('badvalues');
                 node.error(RED._("s7.error.badvalues"));
@@ -96,6 +127,7 @@ module.exports = function(RED) {
                 if (oldValues[key] !== values[key]) {
                     changed = true;
                     node.emit(key, values[key]);
+                    node.emit('__CHANGED__', {key: key, value: values[key]});
                     oldValues[key] = values[key];
                 }
             });
@@ -103,7 +135,12 @@ module.exports = function(RED) {
         }
 
         function doCycle() {
-            node._conn.readAllItems(cycleCallback);
+            if(!readInProgress) {
+                node._conn.readAllItems(cycleCallback);
+                readInProgress = true;
+            } else {
+                readDeferred = true;
+            }
         }
 
         function onConnect(err) {
@@ -124,9 +161,12 @@ module.exports = function(RED) {
 
         node.on('close', function(done) {
             clearInterval(node._td);
-            node._conn.dropConnection();
-            done();
+            node._conn.dropConnection(function() {
+                done();
+            });
         });
+
+        manageStatus('offline');
 
         node._conn.initiateConnection({
             host: config.address,
@@ -135,7 +175,7 @@ module.exports = function(RED) {
             slot: config.slot
         }, onConnect);
     }
-    //util.inherits(S7Endpoint, EventEmitter);
+
     S7Endpoint.prototype.writeVar = function(variable, val) {
         //TODO!!!!
     };
@@ -145,7 +185,7 @@ module.exports = function(RED) {
 
     function S7In(config) {
         var node = this;
-        var endpointStatus, currentVal;
+        var statusVal;
         RED.nodes.createNode(this, config);
 
         node.endpoint = RED.nodes.getNode(config.endpoint);
@@ -153,54 +193,78 @@ module.exports = function(RED) {
             return node.error(RED._("s7.in.error.missingconfig"));
         }
 
-        function onData(data) {
-            var msg = {};
-            currentVal = data;
-            msg.payload = data;
-            msg.topic = config.mode == 'single' ? config.variable : '';
+        function sendMsg(data, key, status) {
+            if (key === undefined) key = '';
+            var msg = {
+                payload: data,
+                topic: key
+            };
+            statusVal = status !== undefined ? status : data;
             node.send(msg);
-            node.status(generateStatus(endpointStatus, currentVal));
+            node.status(generateStatus(node.endpoint.getStatus(), statusVal));
+        }
+
+        function onChanged(variable) {
+            sendMsg(variable.value, variable.key, null);
+        }
+
+        function onDataSplit(data) {
+            Object.keys(data).forEach(function(key) {
+                sendMsg(data[key], key, null)
+            });
+        }
+
+        function onData(data) {
+            sendMsg(data, config.mode == 'single' ? config.variable : '')
         }
 
         function onDataSelect(data) {
             onData(data[config.variable]);
         }
 
-        node.endpoint.on('__STATUS__', function(s) {
-          endpointStatus = s.status;
-          node.status(generateStatus(endpointStatus, currentVal));
-        });
+        function onEndpointStatus(s) {
+            node.status(generateStatus(s.status, statusVal));
+        }
+
+        node.endpoint.on('__STATUS__', onEndpointStatus);
 
         if (config.diff) {
-            if (config.mode == 'all') {
-                node.endpoint.on('__ALL_CHANGED__', onData);
-            } else {
-                node.endpoint.on(config.variable, onData);
+            switch (config.mode) {
+                case 'all-split':
+                    node.endpoint.on('__CHANGED__', onChanged);
+                    break;
+                case 'single':
+                    node.endpoint.on(config.variable, onData);
+                    break;
+                case 'all':
+                default:
+                    node.endpoint.on('__ALL_CHANGED__', onData);
             }
         } else {
-            if (config.mode == 'all') {
-                node.endpoint.on('__ALL__', onData);
-            } else {
-                node.endpoint.on('__ALL__', onDataSelect);
+            switch (config.mode) {
+                case 'all-split':
+                    node.endpoint.on('__ALL__', onDataSplit);
+                    break;
+                case 'single':
+                    node.endpoint.on('__ALL__', onDataSelect);
+                    break;
+                case 'all':
+                default:
+                    node.endpoint.on('__ALL__', onData);
             }
         }
 
         node.on('close', function(done) {
             node.endpoint.removeListener('__ALL__', onDataSelect);
+            node.endpoint.removeListener('__ALL__', onDataSplit);
             node.endpoint.removeListener('__ALL__', onData);
             node.endpoint.removeListener('__ALL_CHANGED__', onData);
+            node.endpoint.removeListener('__CHANGED__', onChanged);
+            node.endpoint.removeListener('__STATUS__', onEndpointStatus);
             node.endpoint.removeListener(config.variable, onData);
             done();
         });
     }
     RED.nodes.registerType("s7 in", S7In);
-
-    /*
-    RED.httpAdmin.get('/pendaq/scope', RED.auth.needsPermission('pendaq.scope'), function(req, res) {
-        res.json({
-            info: "TBD!"
-        });
-    });
-    //*/
 
 };
